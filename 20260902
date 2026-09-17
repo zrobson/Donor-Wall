@@ -1,0 +1,582 @@
+-- KFC Code (with New Building total + band + MASTER DONOR WALL RECOGNITION column added)
+--
+-- OVERVIEW
+--   Builds final_donor_wall_recognition: one wall-ready line per household combining the
+--   primary donor and spouse. Manual fixes live in the manual_overrides CTE and set
+--   manual_change_flag = 'Y'. Raw + cleaned nametags are output alongside for QC.
+--
+-- RULES for final_donor_wall_recognition
+--   * Each person's degree text = their cleaned nametag (NU year first, Kellogg degree
+--     next), stripped of parentheticals, Trustee, CERT+year, and honorary (H)+year.
+--   * Kellogg vs NU is detected from institutional_suffix; the shown text comes from the nametag.
+--   * Order (who is listed first):
+--       1. Kellogg faculty/staff  (if both, female first)
+--       2. Kellogg grad           (if both, female first)
+--       3. otherwise: trustee, then NU grad, then female
+--       4. tie / unknown -> primary donor first
+--   * Same last name: first person's last name is dropped, shared last name shown on the
+--     second person - UNLESS either has a suffix, then both last names are spelled out.
+--   * Different last names: each person shows their own last name.
+--   * Suffix (Jr, III) sits right after that person's last name.
+--   * Two people joined by lowercase " and "; names keep their original capitalization.
+--   * Missing pieces collapse cleanly (no double spaces, no filler).
+--   * Organizations and donor advised funds -> blank (handled in a separate report).
+--   * Anonymous donors -> 'Anonymous'.
+--   * A manual override can replace any name piece, force the order, or replace the whole line.
+--
+-- OPEN QUESTION
+--   Faculty/staff detection (institutional_suffix LIKE '%faculty/staff%') cannot tell
+--   Kellogg staff from Northwestern (NU) staff - follow up on how to separate them.
+
+WITH
+
+-- all campaign gifts, rolled up by source donor
+household_totals AS (
+  SELECT
+    kt.source_donor_id
+    , kt.source_donor_name
+    , SUM(kt.hard_credit_amount) AS total_recognition_credit
+  FROM v_ksm_gifts_ngc kt
+  WHERE kt.full_circle_campaign_priority IS NOT NULL
+  GROUP BY
+    kt.source_donor_id
+    , kt.source_donor_name
+)
+
+-- new building (KEC) giving only, rolled up by source donor
+-- same filter logic as the New Building Code
+, new_building_totals AS (
+  SELECT
+    kt.source_donor_id
+    , SUM(kt.hard_credit_amount) AS new_building_total
+  FROM v_ksm_gifts_ngc kt
+  WHERE (
+    kt.full_circle_campaign_priority = 'KEC'
+    OR kt.cash_category = 'KEC'
+    OR kt.designation_record_id = 'N3024035'
+  )
+  GROUP BY
+    kt.source_donor_id
+)
+
+-- last name + spouse pulled from the entity table
+-- spouse_donor_id used in check-by-hand logic to exclude spouse from triggering flag
+, source_entity AS (
+  SELECT
+    me.donor_id
+    , me.first_name
+    , me.last_name
+    , me.spouse_name
+    , me.spouse_donor_id
+    , me.institutional_suffix
+    , me.spouse_institutional_suffix
+  FROM mv_entity me
+)
+
+-- everyone who appears on a gift with the source donor, deduped
+-- pulling DAF indicator from mv_entity to use in check-by-hand logic
+, credited_names AS (
+  SELECT DISTINCT
+    n.source_donor_id
+    , n.donor_id
+    , n.sort_name
+    , n.person_or_org
+    , n.is_deceased_indicator
+    , n.household_id_ksm
+    , me.donor_advised_fund_indicator
+  FROM v_ksm_gifts_ngc n
+  LEFT JOIN mv_entity me ON me.donor_id = n.donor_id
+  WHERE n.full_circle_campaign_priority IS NOT NULL
+)
+
+-- flags if anyone besides the source donor, their spouse, or a DAF is on the gift
+, household_flag AS (
+  SELECT DISTINCT
+    cn.source_donor_id
+    , MAX(
+        CASE
+          WHEN cn.donor_id != cn.source_donor_id
+           AND cn.donor_id != NVL(se.spouse_donor_id, '-1')
+           AND NVL(cn.donor_advised_fund_indicator, 'N') != 'Y'
+          THEN 1 ELSE 0
+        END
+      ) OVER (PARTITION BY cn.source_donor_id) AS diff_household_flag
+  FROM credited_names cn
+  LEFT JOIN source_entity se ON se.donor_id = cn.source_donor_id
+)
+
+-- total giving by source donor broken out by fund/designation
+, allocation_totals AS (
+  SELECT
+    kt.source_donor_id
+    , kt.designation_name
+    , SUM(kt.hard_credit_amount) AS allocation_credit
+  FROM v_ksm_gifts_ngc kt
+  WHERE kt.full_circle_campaign_priority IS NOT NULL
+  GROUP BY
+    kt.source_donor_id
+    , kt.designation_name
+)
+
+-- ranks each fund per donor -- rank 1 = their biggest gift area
+, top_allocation AS (
+  SELECT
+    source_donor_id
+    , designation_name AS top_designation
+    , allocation_credit AS top_allocation_amount
+    , RANK() OVER (PARTITION BY source_donor_id ORDER BY allocation_credit DESC) AS alloc_rank
+  FROM allocation_totals
+)
+
+-- collapses all credited names into one cell per donor, individuals and orgs split out
+-- deceased donors flagged inline, DAF orgs flagged inline
+, credited_listagg AS (
+  SELECT
+    cn.source_donor_id
+    , LISTAGG(
+        CASE WHEN cn.person_or_org = 'P'
+             THEN cn.sort_name
+                  || CASE WHEN cn.is_deceased_indicator = 'Y' THEN ' [DECEASED]' ELSE '' END
+             ELSE NULL
+        END
+        , ' | '
+      ) WITHIN GROUP (ORDER BY cn.sort_name) AS credited_individuals
+    , LISTAGG(
+        CASE WHEN cn.person_or_org = 'O'
+             THEN cn.sort_name
+                  || CASE WHEN cn.donor_advised_fund_indicator = 'Y' THEN ' [DAF]' ELSE '' END
+             ELSE NULL
+        END
+        , ' | '
+      ) WITHIN GROUP (ORDER BY cn.sort_name) AS credited_organizations
+    , MAX(hf.diff_household_flag) AS diff_household_flag
+  FROM credited_names cn
+  LEFT JOIN household_flag hf ON hf.source_donor_id = cn.source_donor_id
+  LEFT JOIN source_entity se ON se.donor_id = cn.source_donor_id
+  GROUP BY
+    cn.source_donor_id
+)
+
+-- top fund(s) per donor with dollar amount and % of their total giving
+-- if two funds tie for the top, both show up
+-- percent stored as decimal for Excel formatting
+, top_designation_listagg AS (
+  SELECT
+    ta.source_donor_id
+    , LISTAGG(ta.top_designation, ' | ') WITHIN GROUP (ORDER BY ta.top_designation) AS top_designations
+    , MAX(ta.top_allocation_amount) AS top_allocation_amount
+    , ROUND(MAX(ta.top_allocation_amount) / NULLIF(MAX(ht.total_recognition_credit), 0), 4) AS top_allocation_pct
+  FROM top_allocation ta
+  LEFT JOIN household_totals ht ON ht.source_donor_id = ta.source_donor_id
+  WHERE ta.alloc_rank = 1
+  GROUP BY
+    ta.source_donor_id
+)
+
+-- global advisory board
+, GAB as (
+select constituent_donor_id
+      ,'Y' as GAB
+from v_committee_gab
+where involvement_role = 'Member'
+)
+
+-- trustee
+, Trustee as (
+select constituent_donor_id
+      ,'Y' as Trustee
+from v_committee_trustee
+)
+
+-- presidential/VP portfolio flag from knowtify comments
+-- aggregated to one row per donor to avoid duplicating output rows
+, presidential_vp as (
+select mv_entity.donor_id
+      ,LISTAGG(knowtify.name, ' | ') WITHIN GROUP (ORDER BY knowtify.name) as presidential_vp_portfolio_flag
+from stg_alumni.ap_knowtify_comment__c knowtify
+inner join mv_entity on mv_entity.salesforce_id = knowtify.ap_constituent__c
+where lower(knowtify.name) like '%presidential%'
+group by mv_entity.donor_id
+)
+
+-- anonymous donor flag from special handling
+, anonymous_donor as (
+select donor_id
+       ,anonymous_donor
+from mv_special_handling
+)
+
+, suffix as (
+select stg_alumni.v_stm_constituent.CONSTITUENT_DONOR_ID
+      ,stg_alumni.v_stm_constituent.Suffix
+from stg_alumni.v_stm_constituent
+)
+
+-- ============================================================================
+-- DONOR WALL RECOGNITION - added CTEs
+-- ============================================================================
+
+-- MANUAL OVERRIDES - hand-fixes keyed by source_donor_id.
+--   Add one row per household that needs a manual fix. Any ID listed here gets
+--   manual_change_flag = 'Y' automatically. Leave a column NULL to skip that piece.
+--     ov_fn_p / ov_mn_p / ov_ln_p / ov_sfx_p : override primary first/middle/last/suffix
+--     ov_fn_s / ov_mn_s / ov_ln_s / ov_sfx_s : override spouse  first/middle/last/suffix
+--     force_first : 'PRIMARY' or 'SPOUSE'  -> force who is listed first
+--     custom_text : replace the ENTIRE wall line (wins over everything else)
+--   These feed the wall line only; the raw name columns still show the database value.
+--   To add a row, copy the UNION ALL template at the bottom (keep the column order).
+, manual_overrides AS (
+    -- 0000396575: primary first name is 'LORI' in the database; show 'Lori' on the wall
+    SELECT '0000396575' AS source_donor_id
+         , 'Lori'                      AS ov_fn_p
+         , CAST(NULL AS VARCHAR2(100)) AS ov_mn_p
+         , CAST(NULL AS VARCHAR2(100)) AS ov_ln_p
+         , CAST(NULL AS VARCHAR2(50))  AS ov_sfx_p
+         , CAST(NULL AS VARCHAR2(100)) AS ov_fn_s
+         , CAST(NULL AS VARCHAR2(100)) AS ov_mn_s
+         , CAST(NULL AS VARCHAR2(100)) AS ov_ln_s
+         , CAST(NULL AS VARCHAR2(50))  AS ov_sfx_s
+         , CAST(NULL AS VARCHAR2(10))  AS force_first
+         , CAST(NULL AS VARCHAR2(200)) AS custom_text
+    FROM dual
+    -- Template for more rows (fill what you need, leave the rest NULL):
+    --   UNION ALL SELECT '000XXXXXXX',
+    --       NULL, NULL, NULL, NULL,        -- primary  fn, mn, ln, sfx
+    --       NULL, NULL, NULL, NULL,        -- spouse   fn, mn, ln, sfx
+    --       NULL,                          -- force_first: 'PRIMARY' / 'SPOUSE'
+    --       NULL                           -- custom_text
+    --   FROM dual
+)
+
+-- Cleaned nametag per donor. Removes, in order:
+--   1. any text in parentheses and the parentheses          e.g. ('27, '29 P)
+--   2. the word Trustee
+--   3. a certificate token: a two-digit year followed by CERT   e.g. '23 CERT
+--   4. an honorary token: a two-digit year followed by H        e.g. '05 H
+-- then tidies up stray commas and spaces.
+-- NOTE: the CERT/H removals strip any leading punctuation (comma, space, and any
+-- apostrophe style - straight ' or curly ') so no stray apostrophe is left behind.
+, nametag_clean AS (
+  SELECT
+    tn.donor_id
+    , NULLIF(
+        TRIM(
+          REGEXP_REPLACE(                                                                 -- collapse runs of spaces
+            REGEXP_REPLACE(                                                               -- trim leading/trailing commas and spaces
+              REGEXP_REPLACE(                                                             -- collapse repeated commas
+                REGEXP_REPLACE(                                                           -- 4: drop honorary  'YY H  (keep the following delimiter)
+                  REGEXP_REPLACE(                                                         -- 3: drop  'YY CERT
+                    REGEXP_REPLACE(                                                       -- 2: drop Trustee
+                      REGEXP_REPLACE(                                                     -- 1: drop (...) parentheticals
+                        tn.nametag_nu
+                        , '[[:space:]]*\([^)]*\)', '')
+                      , ',?[[:space:]]*Trustee', '', 1, 0, 'i')
+                    , '[^[:alnum:]]*[0-9]{2}[[:space:]]+CERT[[:alpha:]]*', '', 1, 0, 'i')
+                  , '[^[:alnum:]]*[0-9]{2}[[:space:]]+H([^[:alpha:]]|$)', '\1', 1, 0, 'i')
+                , '([[:space:]]*,)+[[:space:]]*', ', ')
+              , '^[[:space:],]+|[[:space:],]+$', '')
+            , '[[:space:]]+', ' ')
+        )
+      , '') AS nametag_clean
+  FROM tableau_nametags tn
+)
+
+-- Gather the primary and spouse pieces + the flags that drive ordering.
+--   fs_*  : is Kellogg faculty/staff (institutional_suffix says faculty/staff)
+--   ksm_* : is a Kellogg grad (institutional_suffix names Kellogg)
+--   tr_*  : is a Trustee
+--   nu_*  : has a Northwestern class year to show (cleaned nametag is not empty)
+--   f_*   : gender code is female ('F')
+, recognition_build AS (
+  SELECT
+    ht.source_donor_id
+    , CASE WHEN LOWER(ent_p.institutional_suffix) LIKE '%kellogg%' THEN 1 ELSE 0 END AS ksm_p
+    , CASE WHEN LOWER(ent_s.institutional_suffix) LIKE '%kellogg%' THEN 1 ELSE 0 END AS ksm_s
+    , CASE WHEN LOWER(ent_p.institutional_suffix) LIKE '%faculty/staff%' THEN 1 ELSE 0 END AS fs_p
+    , CASE WHEN LOWER(ent_s.institutional_suffix) LIKE '%faculty/staff%' THEN 1 ELSE 0 END AS fs_s
+    , CASE WHEN tr_p.Trustee = 'Y' THEN 1 ELSE 0 END AS tr_p
+    , CASE WHEN tr_s.Trustee = 'Y' THEN 1 ELSE 0 END AS tr_s
+    , CASE WHEN nc_p.nametag_clean IS NOT NULL THEN 1 ELSE 0 END AS nu_p
+    , CASE WHEN nc_s.nametag_clean IS NOT NULL THEN 1 ELSE 0 END AS nu_s
+    , CASE WHEN ent_p.gender_code = 'F' THEN 1 ELSE 0 END AS f_p
+    , CASE WHEN ent_s.gender_code = 'F' THEN 1 ELSE 0 END AS f_s
+    , CASE WHEN ent_p.spouse_donor_id IS NOT NULL AND ent_s.first_name IS NOT NULL THEN 1 ELSE 0 END AS has_spouse
+    , CASE WHEN ent_p.donor_advised_fund_indicator = 'Y' THEN 1 ELSE 0 END AS daf_p
+    -- anonymous flag on the source donor. ADJUST '= Y' if the real flag value differs.
+    , an_p.anonymous_donor AS anon_p
+    -- manual override controls (see manual_overrides CTE)
+    , mo.force_first AS force_first
+    , mo.custom_text AS custom_text
+    , CASE WHEN mo.source_donor_id IS NOT NULL THEN 'Y' END AS manual_change_flag
+    -- primary pieces (manual override wins over the database value)
+    , COALESCE(mo.ov_fn_p, ent_p.first_name)  AS fn_p
+    , COALESCE(mo.ov_mn_p, ent_p.middle_name) AS mn_p
+    , COALESCE(mo.ov_ln_p, ent_p.last_name)   AS ln_p
+    , COALESCE(mo.ov_sfx_p, suf_p.suffix)     AS sfx_p
+    , nc_p.nametag_clean AS deg_p
+    -- spouse pieces (manual override wins over the database value)
+    , COALESCE(mo.ov_fn_s, ent_s.first_name)  AS fn_s
+    , COALESCE(mo.ov_mn_s, ent_s.middle_name) AS mn_s
+    , COALESCE(mo.ov_ln_s, ent_s.last_name)   AS ln_s
+    , COALESCE(mo.ov_sfx_s, suf_s.suffix)     AS sfx_s
+    , nc_s.nametag_clean AS deg_s
+  FROM household_totals ht
+  LEFT JOIN mv_entity ent_p    ON ent_p.donor_id = ht.source_donor_id
+  LEFT JOIN mv_entity ent_s    ON ent_s.donor_id = ent_p.spouse_donor_id
+  LEFT JOIN Trustee tr_p       ON tr_p.constituent_donor_id = ht.source_donor_id
+  LEFT JOIN Trustee tr_s       ON tr_s.constituent_donor_id = ent_p.spouse_donor_id
+  LEFT JOIN nametag_clean nc_p ON nc_p.donor_id = ht.source_donor_id
+  LEFT JOIN nametag_clean nc_s ON nc_s.donor_id = ent_p.spouse_donor_id
+  LEFT JOIN suffix suf_p       ON suf_p.constituent_donor_id = ht.source_donor_id
+  LEFT JOIN suffix suf_s       ON suf_s.constituent_donor_id = ent_p.spouse_donor_id
+  LEFT JOIN anonymous_donor an_p ON an_p.donor_id = ht.source_donor_id
+  LEFT JOIN manual_overrides mo  ON mo.source_donor_id = ht.source_donor_id
+)
+
+-- Decide same-vs-different last name, and whether the spouse is listed first.
+, recognition_order AS (
+  SELECT
+    rb.*
+    , CASE
+        WHEN rb.ln_p IS NOT NULL AND rb.ln_s IS NOT NULL
+         AND LOWER(TRIM(rb.ln_p)) = LOWER(TRIM(rb.ln_s))
+        THEN 1 ELSE 0
+      END AS same_last
+    , CASE
+        -- manual override of who is listed first (from manual_overrides)
+        WHEN rb.force_first = 'SPOUSE'  THEN 1
+        WHEN rb.force_first = 'PRIMARY' THEN 0
+        -- Kellogg faculty/staff come first, regardless of gender or alumni status
+        WHEN rb.fs_s = 1 AND rb.fs_p = 0 THEN 1
+        WHEN rb.fs_p = 1 AND rb.fs_s = 0 THEN 0
+        -- both faculty/staff -> female first
+        WHEN rb.fs_p = 1 AND rb.fs_s = 1
+          THEN CASE WHEN rb.f_s = 1 AND rb.f_p = 0 THEN 1 ELSE 0 END
+        -- exactly one Kellogg grad -> that person first
+        WHEN rb.ksm_s = 1 AND rb.ksm_p = 0 THEN 1
+        WHEN rb.ksm_p = 1 AND rb.ksm_s = 0 THEN 0
+        -- both Kellogg grads -> female first
+        WHEN rb.ksm_p = 1 AND rb.ksm_s = 1
+          THEN CASE WHEN rb.f_s = 1 AND rb.f_p = 0 THEN 1 ELSE 0 END
+        -- neither Kellogg grad -> trustee, then NU grad, then female
+        ELSE CASE
+               WHEN rb.tr_s = 1 AND rb.tr_p = 0 THEN 1
+               WHEN rb.tr_p = 1 AND rb.tr_s = 0 THEN 0
+               WHEN rb.nu_s = 1 AND rb.nu_p = 0 THEN 1
+               WHEN rb.nu_p = 1 AND rb.nu_s = 0 THEN 0
+               ELSE CASE WHEN rb.f_s = 1 AND rb.f_p = 0 THEN 1 ELSE 0 END
+             END
+      END AS spouse_first
+  FROM recognition_build rb
+)
+
+-- Lay out person A (listed first) and person B (listed second) from the ordering flag.
+, recognition_ab AS (
+  SELECT
+    ro.source_donor_id
+    , ro.has_spouse
+    , ro.same_last
+    , ro.daf_p
+    , ro.anon_p
+    , ro.custom_text
+    , ro.manual_change_flag
+    , ro.fn_p                                                   -- primary name, used for the org/blank test
+    , ro.ln_p
+    , ro.deg_p AS primary_nametag_cleaned                        -- QC output
+    , ro.deg_s AS spouse_nametag_cleaned                         -- QC output
+    , CASE WHEN ro.spouse_first = 1 THEN ro.fn_s  ELSE ro.fn_p  END AS a_fn
+    , CASE WHEN ro.spouse_first = 1 THEN ro.mn_s  ELSE ro.mn_p  END AS a_mn
+    , CASE WHEN ro.spouse_first = 1 THEN ro.ln_s  ELSE ro.ln_p  END AS a_ln
+    , CASE WHEN ro.spouse_first = 1 THEN ro.sfx_s ELSE ro.sfx_p END AS a_sfx
+    , CASE WHEN ro.spouse_first = 1 THEN ro.deg_s ELSE ro.deg_p END AS a_deg
+    , CASE WHEN ro.spouse_first = 1 THEN ro.fn_p  ELSE ro.fn_s  END AS b_fn
+    , CASE WHEN ro.spouse_first = 1 THEN ro.mn_p  ELSE ro.mn_s  END AS b_mn
+    , CASE WHEN ro.spouse_first = 1 THEN ro.ln_p  ELSE ro.ln_s  END AS b_ln
+    , CASE WHEN ro.spouse_first = 1 THEN ro.sfx_p ELSE ro.sfx_s END AS b_sfx
+    , CASE WHEN ro.spouse_first = 1 THEN ro.deg_p ELSE ro.deg_s END AS b_deg
+  FROM recognition_order ro
+)
+
+-- Build each person's block on its own. Each is space-joined then squeezed so any
+-- missing piece disappears with no double space; an empty block becomes NULL.
+--   a_block: person listed first. Drops the last name when the couple shares one
+--            (the shared last name is shown on person B instead) -- UNLESS either
+--            person has a suffix, in which case both last names are spelled out so
+--            the suffix stays attached to the right person.
+--   b_block: person listed second (only used when there is a spouse).
+, recognition_blocks AS (
+  SELECT
+    ab.source_donor_id
+    , ab.primary_nametag_cleaned
+    , ab.spouse_nametag_cleaned
+    , ab.has_spouse
+    , ab.daf_p
+    , ab.anon_p
+    , ab.custom_text
+    , ab.manual_change_flag
+    , ab.fn_p
+    , ab.ln_p
+    , NULLIF(TRIM(REGEXP_REPLACE(
+        CASE WHEN ab.same_last = 1
+                  AND NULLIF(TRIM(ab.a_sfx), '') IS NULL
+                  AND NULLIF(TRIM(ab.b_sfx), '') IS NULL
+             THEN TRIM(ab.a_fn) ||' '|| TRIM(ab.a_mn) ||' '|| TRIM(ab.a_deg)
+             ELSE TRIM(ab.a_fn) ||' '|| TRIM(ab.a_mn) ||' '|| TRIM(ab.a_ln) ||' '|| TRIM(ab.a_sfx) ||' '|| TRIM(ab.a_deg)
+        END
+      , '[[:space:]]+', ' ')), '') AS a_block
+    , NULLIF(TRIM(REGEXP_REPLACE(
+        TRIM(ab.b_fn) ||' '|| TRIM(ab.b_mn) ||' '|| TRIM(ab.b_ln) ||' '|| TRIM(ab.b_sfx) ||' '|| TRIM(ab.b_deg)
+      , '[[:space:]]+', ' ')), '') AS b_block
+  FROM recognition_ab ab
+)
+
+-- Assemble the final wall line from the two blocks. The word 'and' is only added
+-- when both people actually produced a block, so a missing side never leaves a
+-- dangling ' and '.
+, recognition_final AS (
+  SELECT
+    rb.source_donor_id
+    , rb.primary_nametag_cleaned
+    , rb.spouse_nametag_cleaned
+    , rb.manual_change_flag
+    , CASE
+        -- manual full-line override wins over everything
+        WHEN rb.custom_text IS NOT NULL THEN rb.custom_text
+        -- organization / no personal name -> blank
+        WHEN rb.fn_p IS NULL AND rb.ln_p IS NULL THEN NULL
+        -- donor advised fund -> blank (recognized in a separate report)
+        WHEN rb.daf_p = 1 THEN NULL
+        -- anonymous -> listed as Anonymous  (adjust 'Y' to the real flag value if needed)
+        WHEN rb.anon_p = 'Y' THEN 'Anonymous'
+        -- one person
+        WHEN rb.has_spouse = 0 THEN rb.a_block
+        -- two people, both blocks present -> join with ' and '
+        WHEN rb.a_block IS NOT NULL AND rb.b_block IS NOT NULL THEN rb.a_block || ' and ' || rb.b_block
+        -- safety net: only one block came back -> show it alone, no dangling ' and '
+        ELSE COALESCE(rb.a_block, rb.b_block)
+      END AS master_donor_wall_recognition
+  FROM recognition_blocks rb
+)
+
+SELECT
+  ht.source_donor_id
+  ,e.is_deceased_indicator
+  ,e.gender_code
+  ,e.primary_record_type
+  , CASE WHEN e.donor_advised_fund_indicator = 'Y' THEN 'Y' END AS source_donor_daf_flag
+  , ht.source_donor_name
+  --- names of folks on the list, int suffix and kellogg degree info
+  , e.first_name
+  , e.middle_name
+  , e.last_name
+  , suffix.suffix
+  , se.institutional_suffix
+  , CASE WHEN LOWER(se.institutional_suffix) LIKE '%faculty/staff%' THEN 'Y' END AS faculty_staff_flag
+  , d.first_ksm_year
+  , d.program
+  , d.program_group
+  , d.degrees_concat
+  , GAB.GAB
+  , Trustee.Trustee
+  , pvp.presidential_vp_portfolio_flag
+  , ad.anonymous_donor
+  ,mv_entity_contact_info.email_preferred
+  ,mv_assignments.prospect_manager_name
+  ,mv_assignments.lagm_name
+  --- spouse information - ID, name, int suffix and kellogg degree info
+  , se.spouse_donor_id
+  ,e2.is_deceased_indicator as spouse_is_deceased_indicator
+  ,e2.gender_code as spouse_gender_code
+  ,e2.primary_record_type as spouse_primary_record_type
+  ,se.spouse_name
+  ,e2.first_name as spouse_first_name
+  ,e2.middle_name as spouse_middle_name
+  ,e2.last_name as spouse_last_name
+  ,suffix_2.suffix as spouse_suffix
+  , se.spouse_institutional_suffix
+  , CASE WHEN LOWER(se.spouse_institutional_suffix) LIKE '%faculty/staff%' THEN 'Y' END AS spouse_faculty_staff_flag
+  , d2.first_ksm_year as spouse_first_ksm_year
+  , d2.program as spouse_program
+  , d2.program_group as spouse_program_group
+  , d2.degrees_concat as spouse_degrees_concat
+  ,GAB_2.GAB as spouse_GAB
+  ,Trustee_2.Trustee as spouse_Trustee
+  , pvp2.presidential_vp_portfolio_flag as spouse_presidential_vp_portfolio_flag
+  , ad2.anonymous_donor as spouse_anonymous_donor
+  --,mv_entity_contact_info_2.email_preferred as spouse_email_preferred
+  , cl.credited_individuals
+  , cl.credited_organizations
+  , ht.total_recognition_credit
+  , CASE
+      WHEN ht.total_recognition_credit BETWEEN 10000 AND 99999.99 THEN '$10k - $99.9k'
+      WHEN ht.total_recognition_credit BETWEEN 100000 AND 999999.99 THEN '$100k - $999k'
+      WHEN ht.total_recognition_credit BETWEEN 1000000 AND 4999999.99 THEN '$1m - $4.9m'
+      WHEN ht.total_recognition_credit BETWEEN 5000000 AND 9999999.99 THEN '$5m - $9.9m'
+      WHEN ht.total_recognition_credit BETWEEN 10000000 AND 19999999.99 THEN '$10m - $19.9m'
+      WHEN ht.total_recognition_credit BETWEEN 20000000 AND 24999999.99 THEN '$20m - $24.9m'
+      WHEN ht.total_recognition_credit BETWEEN 25000000 AND 49999999.99 THEN '$25m - $49.9m'
+      WHEN ht.total_recognition_credit >= 50000000 THEN '$50m+'
+    END AS recognition_band
+  , nbt.new_building_total
+  , CASE
+      WHEN nbt.new_building_total BETWEEN 10000 AND 99999.99 THEN '$10k - $99.9k'
+      WHEN nbt.new_building_total BETWEEN 100000 AND 999999.99 THEN '$100k - $999k'
+      WHEN nbt.new_building_total BETWEEN 1000000 AND 4999999.99 THEN '$1m - $4.9m'
+      WHEN nbt.new_building_total BETWEEN 5000000 AND 9999999.99 THEN '$5m - $9.9m'
+      WHEN nbt.new_building_total BETWEEN 10000000 AND 19999999.99 THEN '$10m - $19.9m'
+      WHEN nbt.new_building_total BETWEEN 20000000 AND 24999999.99 THEN '$20m - $24.9m'
+      WHEN nbt.new_building_total BETWEEN 25000000 AND 49999999.99 THEN '$25m - $49.9m'
+      WHEN nbt.new_building_total >= 50000000 THEN '$50m+'
+    END AS new_building_band
+  , tdl.top_designations
+  , tdl.top_allocation_amount
+  , tdl.top_allocation_pct
+  , CASE
+      WHEN cl.diff_household_flag = 1
+      THEN 'CHECK BY HAND'
+      ELSE NULL
+    END AS check_by_hand
+  , CASE
+      WHEN ht.total_recognition_credit >= 1000000 THEN '$1M+'
+      WHEN ht.total_recognition_credit BETWEEN 100000 AND 999999.99 THEN '$100K-999K'
+      WHEN ht.total_recognition_credit BETWEEN 10000 AND 99999.99 THEN '$10K-99K'
+    END AS type_of_donor_recognition
+  --- DONOR WALL: raw + cleaned nametags (for QC) and the assembled wall line
+  , tableau_nametags.nametag_nu as primary_nametag
+  , rf.primary_nametag_cleaned
+  , tableau_nametags_2.nametag_nu as spouse_nametag
+  , rf.spouse_nametag_cleaned
+  , rf.master_donor_wall_recognition as final_donor_wall_recognition
+  --- 'Y' when this wall line was changed by a manual override (see manual_overrides CTE)
+  , rf.manual_change_flag
+  --- blank column for staff to hand-note a manual ADD (a household not produced by the query)
+  , CAST(NULL AS VARCHAR2(200)) AS manual_add_notes
+FROM household_totals ht
+LEFT JOIN source_entity se ON se.donor_id = ht.source_donor_id
+---- Degrees for Entity
+LEFT JOIN MV_ENTITY_KSM_DEGREES d on d.donor_id = ht.source_donor_id
+left join mv_entity e on e.donor_id = ht.source_donor_id
+left join GAB on GAB.constituent_donor_id = ht.source_donor_id
+left join Trustee on Trustee.constituent_donor_id = ht.source_donor_id
+left join presidential_vp pvp on pvp.donor_id = ht.source_donor_id
+left join anonymous_donor ad on ad.donor_id = ht.source_donor_id
+left join mv_entity_contact_info on mv_entity_contact_info.donor_id = ht.source_donor_id 
+left join mv_assignments on mv_assignments.donor_id = ht.source_donor_id 
+left join tableau_nametags on tableau_nametags.donor_id = ht.source_donor_id 
+---- Degrees Spouse - Join on Spouse
+LEFT JOIN MV_ENTITY_KSM_DEGREES d2 on d2.donor_id = se.spouse_donor_id
+left join mv_entity e2 on e2.donor_id = se.spouse_donor_id
+left join GAB GAB_2 on GAB_2.constituent_donor_id = se.spouse_donor_id
+left join Trustee Trustee_2 on Trustee_2.constituent_donor_id = se.spouse_donor_id
+left join presidential_vp pvp2 on pvp2.donor_id = se.spouse_donor_id
+left join anonymous_donor ad2 on ad2.donor_id = se.spouse_donor_id
+left join mv_entity_contact_info mv_entity_contact_info_2 on mv_entity_contact_info_2.donor_id = se.spouse_donor_id
+left join tableau_nametags tableau_nametags_2 on tableau_nametags_2.donor_id = se.spouse_donor_id
+left join suffix on suffix.CONSTITUENT_DONOR_ID = ht.source_donor_id
+left join suffix suffix_2 on suffix_2.CONSTITUENT_DONOR_ID = se.spouse_donor_id
+LEFT JOIN credited_listagg cl ON cl.source_donor_id = ht.source_donor_id
+LEFT JOIN top_designation_listagg tdl ON tdl.source_donor_id = ht.source_donor_id
+LEFT JOIN new_building_totals nbt ON nbt.source_donor_id = ht.source_donor_id
+LEFT JOIN recognition_final rf ON rf.source_donor_id = ht.source_donor_id
+WHERE ht.total_recognition_credit >= 10000
+ORDER BY ht.total_recognition_credit DESC
