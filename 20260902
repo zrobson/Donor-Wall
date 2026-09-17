@@ -20,18 +20,13 @@
 --   * Suffix (Jr, III) sits right after that person's last name.
 --   * Two people joined by lowercase " and "; names keep their original capitalization.
 --   * Missing pieces collapse cleanly (no double spaces, no filler).
---   * Donor advised funds -> blank (handled in a separate report). A row with no
---     personal name to build from is also blank.
+--   * Organizations and donor advised funds -> blank (handled in a separate report).
 --   * Anonymous donors -> 'Anonymous'.
 --   * A manual override can replace any name piece, force the order, or replace the whole line.
 --
--- OPEN QUESTIONS / TO REVISIT
---   1. Faculty/staff detection (institutional_suffix LIKE '%faculty/staff%') cannot tell
---      Kellogg staff from Northwestern (NU) staff - follow up on how to separate them.
---   2. Relatives: the wall line covers only the source donor + spouse (per the original
---      spec). Co-credited relatives (child, sibling, co-donor) are NOT on the line - they
---      appear in credited_individuals and trip CHECK BY HAND for manual review. Revisit
---      later if relatives should ever appear on the wall.
+-- OPEN QUESTION
+--   Faculty/staff detection (institutional_suffix LIKE '%faculty/staff%') cannot tell
+--   Kellogg staff from Northwestern (NU) staff - follow up on how to separate them.
 
 WITH
 
@@ -64,52 +59,37 @@ household_totals AS (
     kt.source_donor_id
 )
 
--- reverse spouse map: for each person, who names THEM as a spouse (within mv_entity).
-, spouse_reverse AS (
+-- Deceased spouse recovery. When a spouse dies, the link is dropped from
+-- mv_entity.spouse_donor_id and survives only in mv_entity_relationships as a 'widow'
+-- (or 'widower') role. This maps the DECEASED person (relationship_donor_id) to their
+-- surviving spouse (primary_donor_id) so the survivor still appears on the wall line.
+-- Only fires for widow/widower rows, so it never pairs living or single people.
+-- NOTE: run SELECT DISTINCT primary_role FROM mv_entity_relationships; and add any other
+-- deceased-spouse role values to the list below if they exist.
+, widow_spouse AS (
   SELECT
-    me.spouse_donor_id AS donor_id
-    , MIN(me.donor_id)  AS rev_spouse_donor_id
-  FROM mv_entity me
-  WHERE me.spouse_donor_id IS NOT NULL
-  GROUP BY me.spouse_donor_id
+    relationship_donor_id AS donor_id
+    , MIN(primary_donor_id) AS widow_spouse_donor_id
+  FROM mv_entity_relationships
+  WHERE LOWER(primary_role) IN ('widow','widower')
+  GROUP BY relationship_donor_id
 )
 
--- spouse recovered from mv_entity_relationships. When a spouse dies the link is dropped
--- from mv_entity.spouse_donor_id and survives only here, so this is how a deceased spouse
--- (or a deceased source donor's survivor) is found. Checked in both directions so either
--- partner can locate the other. NOTE: adjust the primary_role list if other spousal role
--- values exist - run: SELECT DISTINCT primary_role FROM mv_entity_relationships;
-, spouse_from_rel AS (
-  SELECT donor_id, MIN(rel_spouse_donor_id) AS rel_spouse_donor_id
-  FROM (
-    SELECT relationship_donor_id AS donor_id, primary_donor_id     AS rel_spouse_donor_id
-    FROM mv_entity_relationships
-    WHERE LOWER(primary_role) IN ('widow','widower','spouse','husband','wife')
-    UNION ALL
-    SELECT primary_donor_id     AS donor_id, relationship_donor_id AS rel_spouse_donor_id
-    FROM mv_entity_relationships
-    WHERE LOWER(primary_role) IN ('widow','widower','spouse','husband','wife')
-  )
-  GROUP BY donor_id
-)
-
--- last name + spouse pulled from the entity table. spouse_donor_id is resolved in order:
---   1. the person's own mv_entity.spouse_donor_id
---   2. whoever names them as a spouse in mv_entity (one-directional living links)
---   3. mv_entity_relationships (recovers a deceased / severed spouse link)
--- Used in check-by-hand logic and all spouse joins.
+-- last name + spouse pulled from the entity table
+-- spouse_donor_id used in check-by-hand logic to exclude spouse from triggering flag.
+-- Uses the person's own spouse link, falling back to the widow recovery above when a
+-- deceased spouse has no live link.
 , source_entity AS (
   SELECT
     me.donor_id
     , me.first_name
     , me.last_name
     , me.spouse_name
-    , COALESCE(me.spouse_donor_id, sr.rev_spouse_donor_id, sfr.rel_spouse_donor_id) AS spouse_donor_id
+    , COALESCE(me.spouse_donor_id, ws.widow_spouse_donor_id) AS spouse_donor_id
     , me.institutional_suffix
     , me.spouse_institutional_suffix
   FROM mv_entity me
-  LEFT JOIN spouse_reverse sr   ON sr.donor_id  = me.donor_id
-  LEFT JOIN spouse_from_rel sfr ON sfr.donor_id = me.donor_id
+  LEFT JOIN widow_spouse ws ON ws.donor_id = me.donor_id
 )
 
 -- everyone who appears on a gift with the source donor, deduped
@@ -384,8 +364,8 @@ from stg_alumni.v_stm_constituent
       END AS same_last
     , CASE
         -- manual override of who is listed first (from manual_overrides)
-        WHEN UPPER(rb.force_first) = 'SPOUSE'  THEN 1
-        WHEN UPPER(rb.force_first) = 'PRIMARY' THEN 0
+        WHEN rb.force_first = 'SPOUSE'  THEN 1
+        WHEN rb.force_first = 'PRIMARY' THEN 0
         -- Kellogg faculty/staff come first, regardless of gender or alumni status
         WHEN rb.fs_s = 1 AND rb.fs_p = 0 THEN 1
         WHEN rb.fs_p = 1 AND rb.fs_s = 0 THEN 0
@@ -482,7 +462,7 @@ from stg_alumni.v_stm_constituent
     , CASE
         -- manual full-line override wins over everything
         WHEN rb.custom_text IS NOT NULL THEN rb.custom_text
-        -- no personal name to build from -> blank
+        -- organization / no personal name -> blank
         WHEN rb.fn_p IS NULL AND rb.ln_p IS NULL THEN NULL
         -- donor advised fund -> blank (recognized in a separate report)
         WHEN rb.daf_p = 1 THEN NULL
