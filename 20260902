@@ -20,13 +20,18 @@
 --   * Suffix (Jr, III) sits right after that person's last name.
 --   * Two people joined by lowercase " and "; names keep their original capitalization.
 --   * Missing pieces collapse cleanly (no double spaces, no filler).
---   * Organizations and donor advised funds -> blank (handled in a separate report).
+--   * Donor advised funds -> blank (handled in a separate report). A row with no
+--     personal name to build from is also blank.
 --   * Anonymous donors -> 'Anonymous'.
 --   * A manual override can replace any name piece, force the order, or replace the whole line.
 --
--- OPEN QUESTION
---   Faculty/staff detection (institutional_suffix LIKE '%faculty/staff%') cannot tell
---   Kellogg staff from Northwestern (NU) staff - follow up on how to separate them.
+-- OPEN QUESTIONS / TO REVISIT
+--   1. Faculty/staff detection (institutional_suffix LIKE '%faculty/staff%') cannot tell
+--      Kellogg staff from Northwestern (NU) staff - follow up on how to separate them.
+--   2. Relatives: the wall line covers only the source donor + spouse (per the original
+--      spec). Co-credited relatives (child, sibling, co-donor) are NOT on the line - they
+--      appear in credited_individuals and trip CHECK BY HAND for manual review. Revisit
+--      later if relatives should ever appear on the wall.
 
 WITH
 
@@ -59,18 +64,52 @@ household_totals AS (
     kt.source_donor_id
 )
 
--- last name + spouse pulled from the entity table
--- spouse_donor_id used in check-by-hand logic to exclude spouse from triggering flag
+-- reverse spouse map: for each person, who names THEM as a spouse (within mv_entity).
+, spouse_reverse AS (
+  SELECT
+    me.spouse_donor_id AS donor_id
+    , MIN(me.donor_id)  AS rev_spouse_donor_id
+  FROM mv_entity me
+  WHERE me.spouse_donor_id IS NOT NULL
+  GROUP BY me.spouse_donor_id
+)
+
+-- spouse recovered from mv_entity_relationships. When a spouse dies the link is dropped
+-- from mv_entity.spouse_donor_id and survives only here, so this is how a deceased spouse
+-- (or a deceased source donor's survivor) is found. Checked in both directions so either
+-- partner can locate the other. NOTE: adjust the primary_role list if other spousal role
+-- values exist - run: SELECT DISTINCT primary_role FROM mv_entity_relationships;
+, spouse_from_rel AS (
+  SELECT donor_id, MIN(rel_spouse_donor_id) AS rel_spouse_donor_id
+  FROM (
+    SELECT relationship_donor_id AS donor_id, primary_donor_id     AS rel_spouse_donor_id
+    FROM mv_entity_relationships
+    WHERE LOWER(primary_role) IN ('widow','widower','spouse','husband','wife')
+    UNION ALL
+    SELECT primary_donor_id     AS donor_id, relationship_donor_id AS rel_spouse_donor_id
+    FROM mv_entity_relationships
+    WHERE LOWER(primary_role) IN ('widow','widower','spouse','husband','wife')
+  )
+  GROUP BY donor_id
+)
+
+-- last name + spouse pulled from the entity table. spouse_donor_id is resolved in order:
+--   1. the person's own mv_entity.spouse_donor_id
+--   2. whoever names them as a spouse in mv_entity (one-directional living links)
+--   3. mv_entity_relationships (recovers a deceased / severed spouse link)
+-- Used in check-by-hand logic and all spouse joins.
 , source_entity AS (
   SELECT
     me.donor_id
     , me.first_name
     , me.last_name
     , me.spouse_name
-    , me.spouse_donor_id
+    , COALESCE(me.spouse_donor_id, sr.rev_spouse_donor_id, sfr.rel_spouse_donor_id) AS spouse_donor_id
     , me.institutional_suffix
     , me.spouse_institutional_suffix
   FROM mv_entity me
+  LEFT JOIN spouse_reverse sr   ON sr.donor_id  = me.donor_id
+  LEFT JOIN spouse_from_rel sfr ON sfr.donor_id = me.donor_id
 )
 
 -- everyone who appears on a gift with the source donor, deduped
@@ -300,7 +339,7 @@ from stg_alumni.v_stm_constituent
     , CASE WHEN nc_s.nametag_clean IS NOT NULL THEN 1 ELSE 0 END AS nu_s
     , CASE WHEN ent_p.gender_code = 'F' THEN 1 ELSE 0 END AS f_p
     , CASE WHEN ent_s.gender_code = 'F' THEN 1 ELSE 0 END AS f_s
-    , CASE WHEN ent_p.spouse_donor_id IS NOT NULL AND ent_s.first_name IS NOT NULL THEN 1 ELSE 0 END AS has_spouse
+    , CASE WHEN se_r.spouse_donor_id IS NOT NULL AND ent_s.first_name IS NOT NULL THEN 1 ELSE 0 END AS has_spouse
     , CASE WHEN ent_p.donor_advised_fund_indicator = 'Y' THEN 1 ELSE 0 END AS daf_p
     -- anonymous flag on the source donor. ADJUST '= Y' if the real flag value differs.
     , an_p.anonymous_donor AS anon_p
@@ -322,13 +361,14 @@ from stg_alumni.v_stm_constituent
     , nc_s.nametag_clean AS deg_s
   FROM household_totals ht
   LEFT JOIN mv_entity ent_p    ON ent_p.donor_id = ht.source_donor_id
-  LEFT JOIN mv_entity ent_s    ON ent_s.donor_id = ent_p.spouse_donor_id
+  LEFT JOIN source_entity se_r ON se_r.donor_id = ht.source_donor_id
+  LEFT JOIN mv_entity ent_s    ON ent_s.donor_id = se_r.spouse_donor_id
   LEFT JOIN Trustee tr_p       ON tr_p.constituent_donor_id = ht.source_donor_id
-  LEFT JOIN Trustee tr_s       ON tr_s.constituent_donor_id = ent_p.spouse_donor_id
+  LEFT JOIN Trustee tr_s       ON tr_s.constituent_donor_id = se_r.spouse_donor_id
   LEFT JOIN nametag_clean nc_p ON nc_p.donor_id = ht.source_donor_id
-  LEFT JOIN nametag_clean nc_s ON nc_s.donor_id = ent_p.spouse_donor_id
+  LEFT JOIN nametag_clean nc_s ON nc_s.donor_id = se_r.spouse_donor_id
   LEFT JOIN suffix suf_p       ON suf_p.constituent_donor_id = ht.source_donor_id
-  LEFT JOIN suffix suf_s       ON suf_s.constituent_donor_id = ent_p.spouse_donor_id
+  LEFT JOIN suffix suf_s       ON suf_s.constituent_donor_id = se_r.spouse_donor_id
   LEFT JOIN anonymous_donor an_p ON an_p.donor_id = ht.source_donor_id
   LEFT JOIN manual_overrides mo  ON mo.source_donor_id = ht.source_donor_id
 )
@@ -344,8 +384,8 @@ from stg_alumni.v_stm_constituent
       END AS same_last
     , CASE
         -- manual override of who is listed first (from manual_overrides)
-        WHEN rb.force_first = 'SPOUSE'  THEN 1
-        WHEN rb.force_first = 'PRIMARY' THEN 0
+        WHEN UPPER(rb.force_first) = 'SPOUSE'  THEN 1
+        WHEN UPPER(rb.force_first) = 'PRIMARY' THEN 0
         -- Kellogg faculty/staff come first, regardless of gender or alumni status
         WHEN rb.fs_s = 1 AND rb.fs_p = 0 THEN 1
         WHEN rb.fs_p = 1 AND rb.fs_s = 0 THEN 0
@@ -442,7 +482,7 @@ from stg_alumni.v_stm_constituent
     , CASE
         -- manual full-line override wins over everything
         WHEN rb.custom_text IS NOT NULL THEN rb.custom_text
-        -- organization / no personal name -> blank
+        -- no personal name to build from -> blank
         WHEN rb.fn_p IS NULL AND rb.ln_p IS NULL THEN NULL
         -- donor advised fund -> blank (recognized in a separate report)
         WHEN rb.daf_p = 1 THEN NULL
